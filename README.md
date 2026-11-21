@@ -39,7 +39,9 @@ Evaluate the geometric stability of multi-step reasoning traces:
 - **`hyperspace_insert_text`** / **`hyperspace_get_points`** / **`hyperspace_delete_points`**: Point-level CRUD operations.
 
 ### 5. Collection Lifecycle & Hardware Acceleration Maintenance
-- Full control over collection creation with quantization schemes (`none`, `medium`, `medium_plus`, `turbo`, `extreme`).
+- Full control over collection creation with quantization schemes (`none`, `medium`, `medium_plus`, `turbo`, `ternary`, `extreme`, and — for L2 / cosine — `rabitq`, `pq4`, `pq`, `opq`). The default is `medium` (int8 codes, 4× less RAM, 98.5% recall in a single pass and 100% with the exact rerank the server applies by default). Trained levels (`rabitq`, `pq4`, `pq`, `opq`) calibrate themselves online; `hyperspace_rebuild_index` also retrains them.
+- Server 4.2.5 sizes shards to the data and tunes `ef_search` on real queries: pass `expected_vectors` only for collections of millions of vectors.
+- `hyperspace_server_status` exposes the server's quantization catalog and engine tunables so agents can choose a level before creating a collection.
 - L0 Hot Tier cache administration (`cache_stats`, `cache_clear`, `cache_config`).
 - Server-side flow matching reconsolidation (`trigger_reconsolidation`), collection freezing, HNSW index rebuilding, and disk vacuuming.
 
@@ -112,21 +114,23 @@ When running a secured local engine while leveraging continuous cloud embeddings
 ```
 
 * `HYPERSPACE_API_KEY`: Authenticates with local gRPC engine (`localhost:50051`).
+* `HYPERSPACE_HTTP_URL` (optional): HTTP API base used for stats, cache, status and extension calls. Defaults to the gRPC host with port − 1 (`localhost:50051` → `http://localhost:50050`).
+* `HYPERSPACE_COMPACT_VECTORS` (optional, `true`): send vectors as compact `repeated float` (`vector_f32`) — half the wire size. Requires HyperspaceDB server ≥ 4.2.5 and `hyperspace-sdk-ts` ≥ 4.2.5.
 * `YAR_API_KEY` (or legacy `CDE_API_KEY`): Authenticates with cloud embeddings endpoint.
 
 ---
 
-## 🧩 Complete Tool Inventory (31 Tools)
+## 🧩 Complete Tool Inventory (32 Tools)
 
 ### 📊 Data Plane Tools
 
 | Tool | Required Parameters | Optional Parameters | Description & Return Value |
 |---|---|---|---|
-| `hyperspace_search_text` | `collection`, `text` | `top_k`, `hybrid_alpha`, `bm25_options` | Semantic + lexical hybrid search. Returns array of matching records with `id`, `score`, and `payload`. |
+| `hyperspace_search_text` | `collection`, `text` | `top_k`, `ef_search` (server ≥ 4.2.5; omit to use the server-tuned beam), `hybrid_alpha`, `bm25_options` | Semantic + lexical hybrid search. Returns array of matching records with `id`, `score`, and `payload`. |
 | `hyperspace_search_wasserstein` | `collection`, `text` | `top_k` | Optimal Transport (Wasserstein) search. Returns array of top matches ranked by Wasserstein distance. |
 | `hyperspace_insert_text` | `collection`, `id`, `text` | `metadata` | Inserts text under numeric `id` with auto-vectorization. Returns status string or error. |
 | `hyperspace_get_points` | `collection`, `ids` | — | Retrieves vector coordinates and metadata for a list of point IDs. Returns JSON array of points. |
-| `hyperspace_create_collection` | `collection` | `dimension`, `metric`, `quantization`, `encryption_key` | Creates a new vector space with chosen geometry, quantization, and optional client-side Zero-Knowledge encryption. Returns `{ success }` object. |
+| `hyperspace_create_collection` | `collection` | `dimension`, `metric`, `quantization` (default `medium`), `expected_vectors` (server ≥ 4.2.5), `encryption_key` | Creates a new vector space with chosen geometry, quantization (`none`, `medium`, `medium_plus`, `turbo`, `ternary`, `extreme`, `rabitq`, `pq4`, `pq`, `opq`), and optional client-side Zero-Knowledge encryption. `expected_vectors` sets the shard count (one per 2M vectors, fixed at creation). Returns `{ success, encrypted, quantization }`, plus a calibration note for trained levels. |
 | `hyperspace_delete_collection` | `collection` | — | Permanently deletes a collection and its vectors. Returns `{ success }` object. |
 | `hyperspace_list_collections` | — | — | Lists all active collections. Returns array of `{ name, dimension, metric, count, encrypted }`. |
 
@@ -165,7 +169,8 @@ When running a secured local engine while leveraging continuous cloud embeddings
 | `hyperspace_cache_config` | `collection`, `policy` | `ann_threshold` | Updates L0 Cache eviction policy (`lru`, `lfu`, `ttl`) and similarity threshold. |
 | `hyperspace_freeze_collection` | `collection` | — | Locks collection into read-only mode to prevent new inserts. |
 | `hyperspace_unfreeze_collection` | `collection` | — | Unlocks a frozen collection to permit modifications. |
-| `hyperspace_rebuild_index` | `collection` | — | Triggers server-side HNSW index rebuild and optimization. |
+| `hyperspace_rebuild_index` | `collection` | — | Rebuilds the HNSW graph from the exact vectors (drops deleted vectors, compacts payloads, swaps the index live) and retrains `rabitq`, `pq4`, `pq`, `opq` quantizers. Returns when done. |
+| `hyperspace_server_status` | — | — | Returns server version, defaults, engine tunables and the quantization catalog (`GET /api/status`). |
 | `hyperspace_vacuum` | — | — | Purges deleted tombstones and reclaims fragmented disk space. |
 
 ---

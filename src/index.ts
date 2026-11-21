@@ -14,6 +14,19 @@ const rawHost = process.env.HYPERSPACE_HOST || "localhost:50051";
 const HYPERSPACE_HOST = rawHost.replace(/^https?:\/\//, '').replace(/\/$/, '');
 const HYPERSPACE_API_KEY = process.env.HYPERSPACE_API_KEY || process.env.YAR_API_KEY || process.env.CDE_API_KEY || "I_LOVE_HYPERSPACEDB";
 
+/** HTTP API base: HYPERSPACE_HTTP_URL, else the gRPC host with port − 1 (server defaults 50051 / 50050). */
+function httpBaseFor(host: string): string {
+  if (process.env.HYPERSPACE_HTTP_URL) return process.env.HYPERSPACE_HTTP_URL.replace(/\/$/, '');
+  const [ip, port] = host.split(':');
+  const p = Number(port);
+  return Number.isFinite(p) && p > 0 ? `http://${ip}:${p - 1}` : `http://${ip}:50050`;
+}
+
+/** Quantization levels accepted by `quantization` on collection create (HyperspaceDB 4.2.5). */
+const QUANTIZATION_LEVELS = ["none", "medium", "medium_plus", "turbo", "ternary", "extreme", "rabitq", "pq4", "pq", "opq"] as const;
+/** Levels that learn a centroid / codebooks (calibrated online by the server, or by an index rebuild). */
+const TRAINED_LEVELS = new Set(["rabitq", "pq4", "pq", "opq"]);
+
 // Helper for Gromov Delta (Ported from Rust SDK)
 function analyzeDeltaHyperbolicity(vectors: number[][], numSamples: number = 100): { delta: number, recommendation: "lorentz" | "poincare" | "cosine" | "l2" } {
   if (vectors.length < 4) return { delta: 0, recommendation: "l2" };
@@ -61,12 +74,16 @@ class HyperspaceMcpServer {
 
   constructor() {
     this.server = new Server(
-      { name: "mcp-hyperspacedb", version: "4.1.0" },
+      { name: "mcp-hyperspacedb", version: "4.2.5" },
       { capabilities: { tools: {} } }
     );
     const isLocal = HYPERSPACE_HOST.startsWith("localhost") || HYPERSPACE_HOST.startsWith("127.0.0.1");
     const grpcKey = (isLocal && HYPERSPACE_API_KEY.startsWith("sk_")) ? "I_LOVE_HYPERSPACEDB" : (HYPERSPACE_API_KEY || "I_LOVE_HYPERSPACEDB");
     this.client = new HyperspaceClient(HYPERSPACE_HOST, grpcKey);
+    // Compact f32 wire vectors (hyperspace-sdk-ts >= 4.2.5, server >= 4.2.5).
+    if (/^(1|true|yes|on)$/i.test(process.env.HYPERSPACE_COMPACT_VECTORS || "")) {
+      (this.client as any).setCompactVectors?.(true);
+    }
     this.setupTools();
     this.server.onerror = (error) => console.error("[MCP Error]", error);
   }
@@ -84,6 +101,7 @@ class HyperspaceMcpServer {
               collection: { type: "string" },
               text: { type: "string" },
               top_k: { type: "number", default: 5 },
+              ef_search: { type: "number", description: "HNSW beam width for this query (server >= 4.2.5), used as given. Higher = better recall, slower. Omit to use the collection's beam, which the server tunes on real queries (the configured ef_search, default 100, is a floor)." },
               hybrid_alpha: { type: "number", description: "Weight for hybrid search fusion (0.0 = lexical only, 1.0 = semantic only). Default: 0.5" },
               bm25_options: {
                 type: "object",
@@ -125,14 +143,20 @@ class HyperspaceMcpServer {
         },
         {
           name: "hyperspace_create_collection",
-          description: "Setup new memory spaces (collections) with specific vector dimension, metric geometry, and quantization level. Returns the created collection config as JSON result.",
+          description: "Setup new memory spaces (collections) with specific vector dimension, metric geometry, and quantization level. Pass `expected_vectors` only for collections that will hold millions of vectors: it sets the shard count, which is fixed at creation (one shard per 2M vectors; one shard serves the most queries per node). Returns the created collection config as JSON result.",
           inputSchema: {
             type: "object",
             properties: {
               collection: { type: "string" },
               dimension: { type: "number", default: 1024, description: "Vector dimension (e.g., 1024)" },
               metric: { type: "string", default: "cosine", description: "Distance metric: l2, cosine, poincare, lorentz, hybrid" },
-              quantization: { type: "string", default: "medium_plus", description: "Quantization level: none, medium, medium_plus, turbo, extreme" },
+              quantization: {
+                type: "string",
+                enum: [...QUANTIZATION_LEVELS],
+                default: "medium",
+                description: "Quantization level. medium (default: 8-bit int8 codes, 4x less RAM, 98.5% recall single pass and 100% with the exact rerank the server applies by default), none (f32), medium_plus (4-bit, any metric), turbo (4-bit spherical), ternary (1.58-bit), extreme (1-bit, any metric), rabitq (1-bit RaBitQ, l2/cosine), pq4 (4-bit PQ fast-scan, l2/cosine), pq / opq (8-bit PQ, l2/cosine, 60x). Trained levels (rabitq, pq4, pq, opq) calibrate themselves online once a shard holds ~1,024 vectors (4,096 for pq/opq); hyperspace_rebuild_index also retrains them."
+              },
+              expected_vectors: { type: "number", description: "Optional expected collection size (server >= 4.2.5). Sets the shard count at creation: one per 2,000,000 vectors, one when omitted." },
               encryption_key: { type: "string", description: "Optional client-side AES-256-GCM + Isometric projection key for zero-knowledge encryption" }
             },
             required: ["collection"]
@@ -324,13 +348,21 @@ class HyperspaceMcpServer {
         },
         {
           name: "hyperspace_rebuild_index",
-          description: "Rebuild and optimize the HNSW index on the server for a specific collection. Returns rebuild status/result as JSON.",
+          description: "Rebuild the HNSW graph of a collection from its exact vectors (hot vacuum): drops deleted vectors, compacts payloads, and swaps the new index in while searches continue; returns when done. For trained quantization levels (rabitq, pq4, pq, opq) it also retrains the centroid / codebooks. Use after large deletions or bulk imports. Returns {success}.",
           inputSchema: {
             type: "object",
             properties: {
               collection: { type: "string", description: "The name of the collection." }
             },
             required: ["collection"]
+          }
+        },
+        {
+          name: "hyperspace_server_status",
+          description: "Server version, defaults and engine tunables (HNSW M / ef floor, exact rerank, ACORN filtering, adaptive ef, delete repair, WAL mode, SIMD backend) plus the catalog of supported quantization levels with bytes per dimension, compatible metrics and calibration needs. Use it to pick a quantization level before creating a collection.",
+          inputSchema: {
+            type: "object",
+            properties: {}
           }
         },
         {
@@ -554,10 +586,11 @@ class HyperspaceMcpServer {
             return { content: [{ type: "text", text: JSON.stringify(res, null, 2) }] };
           }
           case "hyperspace_search_text": {
-            const { collection, text, top_k, hybrid_alpha, bm25_options } = z.object({
+            const { collection, text, top_k, hybrid_alpha, bm25_options, ef_search } = z.object({
               collection: z.string(),
               text: z.string(),
               top_k: z.number().optional(),
+              ef_search: z.number().int().nonnegative().optional(),
               hybrid_alpha: z.number().optional(),
               bm25_options: z.object({
                 method: z.string().optional(),
@@ -566,8 +599,10 @@ class HyperspaceMcpServer {
             }).parse(args);
             const res = await this.client.searchText(text, top_k || 5, collection, {
               hybridAlpha: hybrid_alpha,
-              bm25: bm25_options as any
-            });
+              bm25: bm25_options as any,
+              // `efSearch` needs hyperspace-sdk-ts >= 4.2.5; older SDKs ignore it.
+              ...(ef_search !== undefined ? { efSearch: ef_search } : {}),
+            } as any);
             return { content: [{ type: "text", text: JSON.stringify(res, null, 2) }] };
           }
           case "hyperspace_search_wasserstein": {
@@ -584,16 +619,38 @@ class HyperspaceMcpServer {
             return { content: [{ type: "text", text: `Stored ${id} in ${collection}` }] };
           }
           case "hyperspace_create_collection": {
-            const { collection, dimension, metric, quantization, encryption_key } = z.object({
+            const { collection, dimension, metric, quantization, encryption_key, expected_vectors } = z.object({
               collection: z.string(),
               dimension: z.number().optional(),
               metric: z.string().optional(),
               quantization: z.string().optional(),
-              encryption_key: z.string().optional()
+              encryption_key: z.string().optional(),
+              expected_vectors: z.number().int().positive().optional()
             }).parse(args);
 
             const isHybrid129 = (metric === 'hybrid' && dimension === 129);
             const fullDim = isHybrid129 ? 801 : (dimension || 1024);
+            const q = quantization || 'medium';
+
+            // The SDK has no size hint yet: plain collections with an expected size go through
+            // the HTTP create endpoint, which takes `expected_vectors` (server >= 4.2.5).
+            if (expected_vectors !== undefined && !encryption_key && !isHybrid129) {
+              const clientAny = this.client as any;
+              const headers: Record<string, string> = { "content-type": "application/json" };
+              if (clientAny.apiKey) headers["x-api-key"] = clientAny.apiKey;
+              const res = await fetch(`${httpBaseFor(clientAny.host || HYPERSPACE_HOST)}/api/collections`, {
+                method: "POST",
+                headers,
+                body: JSON.stringify({ name: collection, dimension: fullDim, metric: metric || 'cosine', quantization: q, expected_vectors }),
+              });
+              const body = await res.text();
+              return { content: [{ type: "text", text: JSON.stringify({
+                success: res.ok,
+                quantization: q,
+                expected_vectors,
+                ...(res.ok ? {} : { error: body || res.statusText }),
+              }, null, 2) }] };
+            }
 
             const success = await this.client.createCollection(collection, {
               components: [{ name: 'default', metric: metric || 'cosine', fullDimension: fullDim, weight: 1.0 }],
@@ -601,8 +658,13 @@ class HyperspaceMcpServer {
                 { componentName: 'default', cutoffDimension: 129, storeInRam: true, rerankTopK: 0 }
               ] : [],
               encrypted: !!encryption_key
-            } as any, encryption_key || '', 0.02, quantization || 'medium_plus');
-            return { content: [{ type: "text", text: JSON.stringify({ success, encrypted: !!encryption_key }, null, 2) }] };
+            } as any, encryption_key || '', 0.02, q);
+            return { content: [{ type: "text", text: JSON.stringify({
+              success,
+              encrypted: !!encryption_key,
+              quantization: q,
+              ...(TRAINED_LEVELS.has(q) ? { note: "The quantizer calibrates itself online once ~1,024 vectors are ingested (4,096 for pq/opq); hyperspace_rebuild_index after a large ingest also rebuilds the graph on the trained codes." } : {})
+            }, null, 2) }] };
           }
           case "hyperspace_graph_traverse": {
             const { collection, start_id, max_depth, max_nodes } = z.object({ collection: z.string(), start_id: z.number(), max_depth: z.number().optional(), max_nodes: z.number().optional() }).parse(args);
@@ -634,8 +696,7 @@ class HyperspaceMcpServer {
               try {
                 const clientAny = this.client as any;
                 const host = clientAny.host || "localhost:50051";
-                const ip = host.split(":")[0];
-                const url = `http://${ip}:50050/api/collections/${collection}/analyze/geometry`;
+                const url = `${httpBaseFor(host)}/api/collections/${collection}/analyze/geometry`;
                 const headers: Record<string, string> = {};
                 if (clientAny.apiKey) headers["x-api-key"] = clientAny.apiKey;
                 const res = await fetch(url, { headers });
@@ -701,8 +762,7 @@ class HyperspaceMcpServer {
             try {
               const clientAny = this.client as any;
               const host = clientAny.host || "localhost:50051";
-              const ip = host.split(':')[0];
-              const url = `http://${ip}:50050/api/collections/${collection}/stats`;
+              const url = `${httpBaseFor(host)}/api/collections/${collection}/stats`;
               const headers: { [key: string]: string } = {};
               if (clientAny.apiKey) headers['x-api-key'] = clientAny.apiKey;
               if (clientAny.userId) headers['x-hyperspace-user-id'] = clientAny.userId;
@@ -763,6 +823,14 @@ class HyperspaceMcpServer {
             const { collection } = z.object({ collection: z.string() }).parse(args);
             const success = await this.client.rebuildIndex(collection);
             return { content: [{ type: "text", text: JSON.stringify({ success }, null, 2) }] };
+          }
+          case "hyperspace_server_status": {
+            const clientAny = this.client as any;
+            const headers: Record<string, string> = {};
+            if (clientAny.apiKey) headers["x-api-key"] = clientAny.apiKey;
+            const res = await fetch(`${httpBaseFor(clientAny.host || HYPERSPACE_HOST)}/api/status`, { headers });
+            const data = await res.json();
+            return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
           }
           case "hyperspace_vacuum": {
             const success = await this.client.vacuum();
@@ -881,8 +949,7 @@ class HyperspaceMcpServer {
             }
             const clientAny = this.client as any;
             const host = clientAny.host || "localhost:50051";
-            const ip = host.split(":")[0];
-            const httpBase = process.env.HYPERSPACE_HTTP_URL || `http://${ip}:50050`;
+            const httpBase = httpBaseFor(host);
             const headers: Record<string, string> = { "Content-Type": "application/json" };
             if (clientAny.apiKey) headers["x-api-key"] = clientAny.apiKey;
             const resp = await fetch(`${httpBase}/extensions/${extension}/${action}`, {
