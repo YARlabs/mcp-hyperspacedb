@@ -23,9 +23,9 @@ function httpBaseFor(host: string): string {
 }
 
 /** Quantization levels accepted by `quantization` on collection create (HyperspaceDB 4.2.5). */
-const QUANTIZATION_LEVELS = ["none", "medium", "medium_plus", "turbo", "ternary", "extreme", "rabitq", "pq4", "pq", "opq"] as const;
+const QUANTIZATION_LEVELS = ["none", "medium", "medium_plus", "turbo", "ternary", "extreme", "rabitq4", "rabitq2", "rabitq", "pq4", "pq", "opq"] as const;
 /** Levels that learn a centroid / codebooks (calibrated online by the server, or by an index rebuild). */
-const TRAINED_LEVELS = new Set(["rabitq", "pq4", "pq", "opq"]);
+const TRAINED_LEVELS = new Set(["rabitq4", "rabitq2", "rabitq", "pq4", "pq", "opq"]);
 
 // Helper for Gromov Delta (Ported from Rust SDK)
 function analyzeDeltaHyperbolicity(vectors: number[][], numSamples: number = 100): { delta: number, recommendation: "lorentz" | "poincare" | "cosine" | "l2" } {
@@ -154,7 +154,7 @@ class HyperspaceMcpServer {
                 type: "string",
                 enum: [...QUANTIZATION_LEVELS],
                 default: "medium",
-                description: "Quantization level. medium (default: 8-bit int8 codes, 4x less RAM, 98.5% recall single pass and 100% with the exact rerank the server applies by default), none (f32), medium_plus (4-bit, any metric), turbo (4-bit spherical), ternary (1.58-bit), extreme (1-bit, any metric), rabitq (1-bit RaBitQ, l2/cosine), pq4 (4-bit PQ fast-scan, l2/cosine), pq / opq (8-bit PQ, l2/cosine, 60x). Trained levels (rabitq, pq4, pq, opq) calibrate themselves online once a shard holds ~1,024 vectors (4,096 for pq/opq); hyperspace_rebuild_index also retrains them."
+                description: "Quantization level. medium (default: 8-bit int8 codes, 4x less RAM, 98.5% recall single pass and 100% with the exact rerank the server applies by default), none (f32), medium_plus (4-bit, any metric), turbo (4-bit spherical), ternary (1.58-bit), extreme (1-bit, any metric), rabitq4 (4-bit extended RaBitQ, l2/cosine: half the RAM of medium, ~87% recall single pass and 100% with rerank), rabitq2 (2-bit extended RaBitQ, l2/cosine), rabitq (1-bit RaBitQ, l2/cosine), pq4 (4-bit PQ fast-scan, l2/cosine), pq / opq (8-bit PQ, l2/cosine, 60x). Trained levels (rabitq4, rabitq2, rabitq, pq4, pq, opq) calibrate themselves online once a shard holds ~1,024 vectors (4,096 for pq/opq); hyperspace_rebuild_index also retrains them."
               },
               expected_vectors: { type: "number", description: "Optional expected collection size (server >= 4.2.5). Sets the shard count at creation: one per 2,000,000 vectors, one when omitted." },
               encryption_key: { type: "string", description: "Optional client-side AES-256-GCM + Isometric projection key for zero-knowledge encryption" }
@@ -348,7 +348,7 @@ class HyperspaceMcpServer {
         },
         {
           name: "hyperspace_rebuild_index",
-          description: "Rebuild the HNSW graph of a collection from its exact vectors (hot vacuum): drops deleted vectors, compacts payloads, and swaps the new index in while searches continue; returns when done. For trained quantization levels (rabitq, pq4, pq, opq) it also retrains the centroid / codebooks. Use after large deletions or bulk imports. Returns {success}.",
+          description: "Rebuild the HNSW graph of a collection from its exact vectors (hot vacuum): drops deleted vectors, compacts payloads, and swaps the new index in while searches continue; returns when done. For trained quantization levels (rabitq4, rabitq2, rabitq, pq4, pq, opq) it also retrains the centroid / codebooks. Use after large deletions or bulk imports. Returns {success}.",
           inputSchema: {
             type: "object",
             properties: {
